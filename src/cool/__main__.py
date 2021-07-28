@@ -7,97 +7,114 @@ import typer
 
 sys.path.append(os.getcwd())
 
-from cool.grammar import serialize_parser_and_lexer
+from cool.grammar import Token, serialize_parser_and_lexer
 from cool.lexertab import CoolLexer
 from cool.parsertab import CoolParser
-from cool.semantics import TypeCollector, TypeBuilder, OverriddenMethodChecker, TypeChecker, topological_sorting
-from cool.semantics.execution import Executor, ExecutionError
-from cool.semantics.formatter import CodeBuilder
-from cool.semantics.type_inference import InferenceChecker
+from cool.semantics import (OverriddenMethodChecker, PositionAssigner,
+                            TypeBuilderForFeatures, TypeBuilderForInheritance, TypeChecker, TypeCollector,
+                            topological_sorting)
 from cool.semantics.utils.scope import Context, Scope
 
 app = typer.Typer()
 
 
-def check_semantics(ast, scope: Scope, context: Context, errors: List[str]):
-    TypeCollector(context, errors).visit(ast)
-    TypeBuilder(context, errors).visit(ast)
-    declarations = ast.declarations
-    topological_sorting(ast, context, errors)
-    ast.declarations = declarations
-    if not errors:
-        OverriddenMethodChecker(context, errors).visit(ast)
-        InferenceChecker(context, errors).visit(ast, scope)
-        TypeChecker(context, errors).visit(ast, scope)
-    return ast, scope, context, errors
+def log_success(s: str):
+    styled_e = typer.style(s, fg=typer.colors.GREEN, bold=True)
+    typer.echo(styled_e)
 
 
-def tokenize(file: str, verbose: bool = False):
-    path = Path.cwd() / file
-    if not path.exists():
-        typer.echo(f'File {file} does not exist.')
-        exit()
-    s = path.open('r').read()
+def log_error(s: str):
+    styled_e = typer.style(s, fg=typer.colors.RED, bold=True)
+    typer.echo(styled_e)
+
+
+def format_tokens(tokens: List[Token]) -> str:
+    s = ''
+    last_line = 1
+    for t in tokens:
+        if t.line != last_line:
+            last_line = t.line
+            s += '\n' + ' ' * t.column
+        else:
+            s += ' '
+        s += t.token_type.name
+    return s
+
+
+def tokenize(program: str, verbose: bool = False):
     lexer = CoolLexer()
-    tokens = lexer(s)
+    tokens = lexer(program)
 
     if lexer.contain_errors:
         for e in lexer.errors:
-            typer.echo(e, err=True)
+            log_error(e)
 
     if verbose:
-        for t in tokens:
-            typer.echo(t)
-
+        log_success('Tokens:')
+        log_success('-' * 80)
+        log_success(format_tokens(tokens) + '\n')
+        log_success('-' * 80)
+        print()
+    
     return tokens, lexer
 
 
-def parse(file: str, verbose: bool = False):
-    tokens, lexer = tokenize(file, verbose)
-
-    if lexer.contain_errors:
-        return None, None
-
+def parse(tokens: List[Token], verbose: bool = False):
     parser = CoolParser(verbose)
     ast = parser(tokens)
 
     if parser.contains_errors:
-        typer.echo(parser.errors[0], err=True)
+        for e in parser.errors:
+            log_error(e)
 
     return ast, parser
 
 
-@app.command()
-def infer(file: str, verbose: bool = False):
-    ast, _ = parse(file, verbose)
-
-    if ast is not None:
-        ast, _, _, errors = check_semantics(ast, Scope(), Context(), [])
-        if errors:
-            for e in errors:
-                typer.echo(e, err=True)
-        typer.echo(CodeBuilder().visit(ast, 0))
-
+def check_semantics(ast, scope: Scope, context: Context, errors: List[str]):
+    TypeCollector(context, errors).visit(ast)
+    TypeBuilderForInheritance(context, errors).visit(ast)
+    topological_sorting(ast, context, errors)
+    if not errors:
+        TypeBuilderForFeatures(context, errors).visit(ast)
+        OverriddenMethodChecker(context, errors).visit(ast)
+        TypeChecker(context, errors).visit(ast, scope)
+    return ast, scope, context, errors
 
 @app.command()
-def run(file: str, verbose: bool = False):
-    ast, parser = parse(file, verbose)
+def compile(
+        input_file: typer.FileText = typer.Argument(..., help='Cool file'),
+        output_file: typer.FileTextWrite = typer.Argument('a.mips', help='Mips file'),
+        verbose: bool = typer.Option(False, help='Run in verbose mode.')
+):
+    # In case of encoding conflict
+    if input_file.encoding.lower != 'utf-8':
+        input_file = open(input_file.name, encoding='utf-8')
+    
+    program = input_file.read()
+    tokens, lexer = tokenize(program, verbose)
 
-    if ast is not None:
-        ast, _, context, errors = check_semantics(ast, Scope(), Context(), [])
-
-        if not errors and not parser.contains_errors:
-            try:
-                Executor(context).visit(ast, Scope())
-                typer.echo('Program finished...')
-            except ExecutionError as e:
-                typer.echo(e.text, err=True)
-
-        for error in errors:
-            typer.echo(error, err=True)
-        exit(0)
-    else:
+    if lexer is None or lexer.contain_errors:
         exit(1)
+
+    if not tokens[:-1]:  # there is always at least the EOF token
+        log_error('(0, 0) - SyntacticError: ERROR at or near EOF')
+        exit(1)
+    
+    ast, parser = parse(tokens, verbose)
+
+    # parsing process failed
+    if ast is None:
+        exit(1)
+
+    PositionAssigner(tokens).visit(ast)
+    ast, _, _, errors = check_semantics(ast, Scope(), Context(), [])
+
+    if errors or parser.contains_errors:
+        for e in errors:
+            log_error(e)
+        exit(1)
+    
+    exit(0)
 
 @app.command()
 def serialize():
